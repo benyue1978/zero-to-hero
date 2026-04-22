@@ -1,0 +1,9 @@
+torch
+datasets
+transformers
+tiktoken
+tqdm
+numpy
+matplotlib
+regex
+sentencepiece
