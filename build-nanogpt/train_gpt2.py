@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import inspect
 
 # ----------------------------------------
 
@@ -34,10 +35,15 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # attention (materializes the large (T,T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        
+        # flash attention implementation, faster than naive softmax version
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -181,6 +187,30 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups, Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensor in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.ndim >= 2]
+        no_decay_params = [p for n, p in param_dict.items() if p.ndim < 2]
+
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_no_decay_params = sum(p.numel() for p in no_decay_params)
+        print(f"num decayed parameters: {num_decay_params:,}")
+        print(f"num non-decayed parameters: {num_no_decay_params:,}")
+        # Create the AdamW optimizer from the grouped parameters with the appropriate weight decay
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
 
 # -----------------------------------------
 import tiktoken
@@ -311,35 +341,70 @@ if torch.cuda.is_available():
 # use the dataloader
 import time
 
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
+# simulate a larger batch size by accumulating gradients over multiple forward/backward passes
+# according to GPT-3 paper, the optimal batch size is 512K tokens, so we will use that as our "effective batch size"
+total_batch_size = 131072 #524288 # 2**29 ~0.5M, in number of tokens
+B = 4 # micro batch size, in number of sequences
+T = 1024 # sequence length, in number of tokens
+assert total_batch_size % (B * T) == 0, "total_batch_size must be divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total batch size: {total_batch_size}")
+print(f"calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=4, T=1024)
+train_loader = DataLoaderLite(B=B, T=T) # adjust B to fit in memory, adjust T for context length (try 512 or 1024)
 
 #torch.set_float32_matmul_precision('high')
 
-model = GPT(GPTConfig())
-model.eval()
+model = GPT(GPTConfig(vocab_size=50304)) # padding tokens to 50304 to be divisible by 128, which is a nicer number, because power of 2.
 model.to(device)
 model = torch.compile(model) # about 2x speedup on RTX 5080
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+def get_lr(it):
+    # 1) liear warmup for warmup_steps steps
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    return min_lr + coeff * (max_lr - min_lr)
+
+#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
+
+for step in range(50):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x = x.to(device)
-    y = y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16): # https://docs.pytorch.org/docs/stable/amp.html
-        logits, loss = model(x, y)
-        #import code; code.interact(local=locals())
-    loss.backward()
+    loss_accum = 0.0
+    # micro steps
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16): # https://docs.pytorch.org/docs/stable/amp.html
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps # scale the loss to account for gradient accumulation
+        loss_accum += loss.detach()
+        loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # clip the gradient to prevent exploding gradients, especially on larger models
+    # determine and set the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize() # wait for the GPU to finish before measuring time
     t1 = time.time()
-    dt = (t1 - t0) * 1000
-    token_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}: loss {loss.item():.4f}, time {dt:.2f} ms, tokens/sec {token_per_sec:.2f}")
+    dt = t1 - t0
+    token_processed = grad_accum_steps * train_loader.B * train_loader.T
+    token_per_sec = token_processed / dt
+    print(f"step: {step:4d} | loss: {loss_accum:.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} ms | tokens/sec: {token_per_sec:.2f}")
 
 # -------------------------
 
